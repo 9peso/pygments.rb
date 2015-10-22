@@ -7,15 +7,16 @@
     :license: BSD, see LICENSE for details.
 """
 
-# Test the command line interface
+from __future__ import print_function
 
 import io
+import os
 import sys
+import tempfile
 import unittest
 
-from pygments import highlight
-from pygments.util import StringIO
-from pygments.cmdline import main as cmdline_main
+from pygments import highlight, cmdline
+from pygments.util import StringIO, BytesIO
 
 import support
 
@@ -25,14 +26,24 @@ TESTFILE, TESTDIR = support.location(__file__)
 def run_cmdline(*args):
     saved_stdout = sys.stdout
     saved_stderr = sys.stderr
-    new_stdout = sys.stdout = StringIO()
-    new_stderr = sys.stderr = StringIO()
+    if sys.version_info > (3,):
+        stdout_buffer = BytesIO()
+        stderr_buffer = BytesIO()
+        new_stdout = sys.stdout = io.TextIOWrapper(stdout_buffer, 'utf-8')
+        new_stderr = sys.stderr = io.TextIOWrapper(stderr_buffer, 'utf-8')
+    else:
+        stdout_buffer = new_stdout = sys.stdout = StringIO()
+        stderr_buffer = new_stderr = sys.stderr = StringIO()
     try:
-        ret = cmdline_main(["pygmentize"] + list(args))
+        ret = cmdline.main(["pygmentize"] + list(args))
     finally:
         sys.stdout = saved_stdout
         sys.stderr = saved_stderr
-    return (ret, new_stdout.getvalue(), new_stderr.getvalue())
+    new_stdout.flush()
+    new_stderr.flush()
+    out, err = stdout_buffer.getvalue().decode('utf-8'), \
+        stderr_buffer.getvalue().decode('utf-8')
+    return (ret, out, err)
 
 
 class CmdLineTest(unittest.TestCase):
@@ -83,7 +94,7 @@ class CmdLineTest(unittest.TestCase):
     def test_invalid_opts(self):
         for opts in [("-L", "-lpy"), ("-L", "-fhtml"), ("-L", "-Ox"),
                      ("-a",), ("-Sst", "-lpy"), ("-H",),
-                     ("-H", "formatter"),]:
+                     ("-H", "formatter")]:
             self.assertTrue(run_cmdline(*opts)[0] == 2)
 
     def test_normal(self):
@@ -91,11 +102,8 @@ class CmdLineTest(unittest.TestCase):
         from pygments.lexers import PythonLexer
         from pygments.formatters import HtmlFormatter
         filename = TESTFILE
-        fp = open(filename, 'rb')
-        try:
+        with open(filename, 'rb') as fp:
             code = fp.read()
-        finally:
-            fp.close()
 
         output = highlight(code, PythonLexer(), HtmlFormatter())
 
@@ -104,3 +112,54 @@ class CmdLineTest(unittest.TestCase):
         self.assertEqual(o, output)
         self.assertEqual(e, "")
         self.assertEqual(c, 0)
+
+    def test_outfile(self):
+        # test that output file works with and without encoding
+        fd, name = tempfile.mkstemp()
+        os.close(fd)
+        for opts in [['-fhtml', '-o', name, TESTFILE],
+                     ['-flatex', '-o', name, TESTFILE],
+                     ['-fhtml', '-o', name, '-O', 'encoding=utf-8', TESTFILE]]:
+            try:
+                self.assertEqual(run_cmdline(*opts)[0], 0)
+            finally:
+                os.unlink(name)
+
+    def check_failure(self, *cmdline):
+        c, o, e = run_cmdline(*cmdline)
+        self.assertEqual(c, 1)
+        self.assertEqual(o, '')
+        return e
+
+    def test_errors(self):
+        # input file not found
+        e = self.check_failure('-lpython', 'nonexistent.py')
+        self.assertTrue('Error: cannot read infile' in e)
+        self.assertTrue('nonexistent.py' in e)
+
+        # lexer not found
+        e = self.check_failure('-lfooo', TESTFILE)
+        self.assertTrue('Error: no lexer for alias' in e)
+
+        # formatter not found
+        e = self.check_failure('-lpython', '-ffoo', TESTFILE)
+        self.assertTrue('Error: no formatter found for name' in e)
+
+        # output file not writable
+        e = self.check_failure('-o', os.path.join('nonexistent', 'dir', 'out.html'),
+                               '-lpython', TESTFILE)
+        self.assertTrue('Error: cannot open outfile' in e)
+        self.assertTrue('out.html' in e)
+
+        # unknown filter
+        e = self.check_failure('-F', 'foo', TESTFILE)
+        self.assertTrue('Error: filter \'foo\' not found' in e)
+
+    def test_exception(self):
+        # unexpected exception while highlighting
+        cmdline.highlight = None  # override callable
+        try:
+            e = self.check_failure('-lpython', TESTFILE)
+        finally:
+            cmdline.highlight = highlight
+        self.assertTrue('*** Error while highlighting:' in e)
